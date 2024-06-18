@@ -31,6 +31,7 @@ module sui_system::staking_pool {
     const EActivationOfInactivePool: u64 = 16;
     const EDelegationOfZeroSui: u64 = 17;
     const EStakedSuiBelowThreshold: u64 = 18;
+    const ECannotMintFungibleStakeYet: u64 = 19;
 
     /// A staking pool embedded in each validator struct in the system state object.
     public struct StakingPool has key, store {
@@ -79,6 +80,30 @@ module sui_system::staking_pool {
         /// The staked SUI tokens.
         principal: Balance<SUI>,
     }
+
+    /// An alternative to `StakedSui` that holds the pool token amount instead of the SUI balance.
+    /// StakedSui objects can be converted to FungibleStakes after the initial warmup period. 
+    /// The advantage of this is that you can now merge multiple StakedSui objects from different 
+    /// activation epochs into a single FungibleStake object.
+    public struct FungibleStake has key, store {
+        id: UID,
+        /// ID of the staking pool we are staking with.
+        pool_id: ID,
+        /// The pool token amount.
+        value: u64,
+    }
+
+    /// Holds useful information
+    public struct FungibleStakeData has key, store {
+        id: UID,
+        /// fungible_stake supply
+        total_supply: u64,
+        /// principal balance. Rewards are withdrawn from the reward pool
+        principal: Balance<SUI>,
+    }
+
+    // === dynamic field keys ===
+    public struct FungibleStakeDataKey has copy, store, drop {}
 
     // ==== initializer ====
 
@@ -148,6 +173,108 @@ module sui_system::staking_pool {
         // TODO: implement withdraw bonding period here.
         principal_withdraw.join(rewards_withdraw);
         principal_withdraw
+    }
+
+    public(package) fun redeem_fungible_stake(
+        pool: &mut StakingPool,
+        fungible_stake: FungibleStake,
+        ctx: &mut TxContext
+    ) : Balance<SUI> {
+        let FungibleStake { id, pool_id, value } = fungible_stake;
+        assert!(pool_id == object::id(pool), EWrongPool);
+
+        object::delete(id);
+
+        // calculate the amount of principal and rewards to withdraw
+        let exchange_rate = pool_token_exchange_rate_at_epoch(pool, tx_context::epoch(ctx));
+        let sui_amount_out = get_sui_amount(&exchange_rate, value);
+
+        // withdraw the principal amount from principal, and rest from rewards
+        // need to be careful here with precision, as we don't want to over withdraw.
+        let fungible_stake_data: &mut FungibleStakeData = bag::borrow_mut(&mut pool.extra_fields, FungibleStakeDataKey {});
+
+        // do the calculations in fixed point. it's important to be precise here as we don't 
+        // want to overestimate the rewards amount, as that can cause problems.
+        // TODO: im pretty sure this will never overflow as the initial values are all u64, 
+        // but good to double check.
+        let principal_amount_fp = ((value as u256) << 64)
+                             * ((balance::value(&fungible_stake_data.principal) as u256) << 64)
+                             / ((fungible_stake_data.total_supply as u256) << 64);
+
+        let rewards_amount_fp = ((sui_amount_out as u256) << 64) - principal_amount_fp;
+
+        // convert back to u64
+        let principal_amount = ((principal_amount_fp >> 64) as u64);
+        let rewards_amount = ((rewards_amount_fp >> 64) as u64);
+
+        fungible_stake_data.total_supply = fungible_stake_data.total_supply - value;
+
+        let mut sui_out = balance::split(&mut fungible_stake_data.principal, principal_amount);
+        balance::join(
+            &mut sui_out,
+            balance::split(&mut pool.rewards_pool, rewards_amount)
+        );
+
+        assert!(balance::value(&sui_out) <= sui_amount_out, 0);
+
+        pool.pending_total_sui_withdraw = pool.pending_total_sui_withdraw + balance::value(&sui_out);
+        pool.pending_pool_token_withdraw = pool.pending_pool_token_withdraw + value;
+
+        sui_out
+    }
+
+    /// Convert the given staked SUI to an FungibleStake object
+    public(package) fun convert_to_fungible_stake(
+        pool: &mut StakingPool,
+        staked_sui: StakedSui,
+        ctx: &mut TxContext
+    ) : FungibleStake {
+        let StakedSui { id, pool_id, stake_activation_epoch, principal } = staked_sui;
+
+        assert!(pool_id == object::id(pool), EWrongPool);
+        assert!(
+            tx_context::epoch(ctx) >= stake_activation_epoch, 
+            ECannotMintFungibleStakeYet
+        );
+
+        object::delete(id);
+
+
+        let exchange_rate_at_staking_epoch = pool_token_exchange_rate_at_epoch(
+            pool, 
+            stake_activation_epoch
+        );
+
+        let pool_token_amount = get_token_amount(
+            &exchange_rate_at_staking_epoch, 
+            balance::value(&principal)
+        );
+
+        if (!bag::contains(&pool.extra_fields, FungibleStakeDataKey {})) {
+            bag::add(
+                &mut pool.extra_fields, 
+                FungibleStakeDataKey {}, 
+                FungibleStakeData { 
+                    id: object::new(ctx), 
+                    total_supply: pool_token_amount, 
+                    principal
+                }
+            );
+        } 
+        else {
+            let fungible_stake_data: &mut FungibleStakeData = bag::borrow_mut(&mut pool.extra_fields, FungibleStakeDataKey {});
+            fungible_stake_data.total_supply = fungible_stake_data.total_supply + pool_token_amount;
+            balance::join(
+                &mut fungible_stake_data.principal, 
+                principal
+            );
+        };
+
+        FungibleStake {
+            id: object::new(ctx),
+            pool_id,
+            value: pool_token_amount,
+        }
     }
 
     /// Withdraw the principal SUI stored in the StakedSui object, and calculate the corresponding amount of pool
@@ -285,6 +412,8 @@ module sui_system::staking_pool {
 
     public fun pool_id(staked_sui: &StakedSui): ID { staked_sui.pool_id }
 
+    public fun fungible_stake_pool_id(fungible_stake: &FungibleStake): ID { fungible_stake.pool_id }
+
     public fun staked_sui_amount(staked_sui: &StakedSui): u64 { staked_sui.principal.value() }
 
     /// Allows calling `.amount()` on `StakedSui` to invoke `staked_sui_amount`
@@ -302,6 +431,32 @@ module sui_system::staking_pool {
     /// Returns true if the input staking pool is inactive.
     public fun is_inactive(pool: &StakingPool): bool {
         pool.deactivation_epoch.is_some()
+    }
+
+    public fun fungible_stake_value(fungible_stake: &FungibleStake): u64 { fungible_stake.value }
+
+    public fun split_fungible_stake(fungible_stake: &mut FungibleStake, split_amount: u64, ctx: &mut TxContext): FungibleStake {
+        assert!(split_amount <= fungible_stake.value, EInsufficientPoolTokenBalance);
+
+        fungible_stake.value = fungible_stake.value - split_amount;
+
+        assert!(fungible_stake.value >= MIN_STAKING_THRESHOLD, EStakedSuiBelowThreshold);
+        assert!(split_amount >= MIN_STAKING_THRESHOLD, EStakedSuiBelowThreshold);
+
+        FungibleStake {
+            id: object::new(ctx),
+            pool_id: fungible_stake.pool_id,
+            value: split_amount,
+        }
+    }
+
+    public fun join_fungible_stake(self: &mut FungibleStake, other: FungibleStake) {
+        let FungibleStake { id, pool_id, value } = other;
+        assert!(self.pool_id == pool_id, EWrongPool);
+
+        object::delete(id);
+
+        self.value = self.value + value;
     }
 
     /// Split StakedSui `self` to two parts, one with principal `split_amount`,
@@ -464,5 +619,163 @@ module sui_system::staking_pool {
         reward_withdraw_amount = reward_withdraw_amount.min(pool.rewards_pool.value());
 
         staked_amount + reward_withdraw_amount
+    }
+
+    // written for my own understanding of how staking_pool.move works.
+    #[test]
+    public fun test_basic() {
+        use sui::test_scenario::{Self, ctx};
+        use sui::tx_context::{epoch};
+        use sui::coin::{Self};
+
+        let mut scenario = test_scenario::begin(@0x0);
+
+
+        let mut staking_pool = new(ctx(&mut scenario));
+        activate_staking_pool(&mut staking_pool, epoch(ctx(&mut scenario)));
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 0) == 1, 0);
+
+        // epoch 1
+        let sui = coin::mint_for_testing<SUI>(1_000_000_000, ctx(&mut scenario));
+        let staked_sui_1 = request_add_stake(
+            &mut staking_pool, 
+            coin::into_balance(sui), 
+            epoch(ctx(&mut scenario)) + 1, 
+            ctx(&mut scenario)
+        );
+        assert!(balance::value(&staked_sui_1.principal) == 1_000_000_000, 0);
+
+        let sui = coin::mint_for_testing<SUI>(1_000_000_000, ctx(&mut scenario));
+        let staked_sui_2 = request_add_stake(
+            &mut staking_pool, 
+            coin::into_balance(sui), 
+            epoch(ctx(&mut scenario)) + 1, 
+            ctx(&mut scenario)
+        );
+        assert!(balance::value(&staked_sui_2.principal) == 1_000_000_000, 0);
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 0) == 2, 0);
+
+        assert!(staking_pool.sui_balance == 2_000_000_000, 0);
+        assert!(staking_pool.pool_token_balance == 2_000_000_000, 0);
+
+        // epoch 2
+        // shouldn't get any rewards for this epoch
+        let sui = request_withdraw_stake(&mut staking_pool, staked_sui_1, ctx(&mut scenario));
+        assert!(balance::value(&sui) == 1_000_000_000, 0);
+        sui::test_utils::destroy(sui);
+
+        assert!(staking_pool.pending_total_sui_withdraw == 1_000_000_000, 0);
+        assert!(staking_pool.pending_pool_token_withdraw == 1_000_000_000, 0);
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 1_000_000_000) == 3, 0);
+
+        assert!(staking_pool.sui_balance == 2_000_000_000, 0);
+        assert!(staking_pool.pool_token_balance == 1_000_000_000, 0);
+
+        // epoch 3
+        let sui = request_withdraw_stake(&mut staking_pool, staked_sui_2, ctx(&mut scenario));
+        std::debug::print(&balance::value(&sui));
+        assert!(balance::value(&sui) == 2_000_000_000, 0);
+        sui::test_utils::destroy(sui);
+        std::debug::print(&staking_pool);
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 0) == 4, 0);
+
+        std::debug::print(&staking_pool);
+
+        sui::test_utils::destroy(staking_pool);
+        test_scenario::end(scenario);
+    }
+
+    #[test]
+    public fun test_fungible_stake() {
+        use sui::test_scenario::{Self, ctx};
+        use sui::tx_context::{epoch};
+        use sui::coin::{Self};
+
+        let mut scenario = test_scenario::begin(@0x0);
+        let mut staking_pool = new(ctx(&mut scenario));
+
+        activate_staking_pool(&mut staking_pool, epoch(ctx(&mut scenario)));
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 0) == 1, 0);
+
+        // epoch 1
+        let sui = coin::mint_for_testing<SUI>(1_000_000_000, ctx(&mut scenario));
+        let staked_sui_1 = request_add_stake(
+            &mut staking_pool, 
+            coin::into_balance(sui), 
+            epoch(ctx(&mut scenario)) + 1, 
+            ctx(&mut scenario)
+        );
+        assert!(balance::value(&staked_sui_1.principal) == 1_000_000_000, 0);
+
+        let sui = coin::mint_for_testing<SUI>(1_000_000_000, ctx(&mut scenario));
+        let staked_sui_2 = request_add_stake(
+            &mut staking_pool, 
+            coin::into_balance(sui), 
+            epoch(ctx(&mut scenario)) + 1, 
+            ctx(&mut scenario)
+        );
+        assert!(balance::value(&staked_sui_2.principal) == 1_000_000_000, 0);
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 0) == 2, 0);
+
+        assert!(staking_pool.sui_balance == 2_000_000_000, 0);
+        assert!(staking_pool.pool_token_balance == 2_000_000_000, 0);
+
+        let fungible_stake_1 = convert_to_fungible_stake(&mut staking_pool, staked_sui_1, ctx(&mut scenario));
+        assert!(fungible_stake_1.value == 1_000_000_000, 0);
+
+        let fungible_stake_2 = convert_to_fungible_stake(&mut staking_pool, staked_sui_2, ctx(&mut scenario));
+        assert!(fungible_stake_2.value == 1_000_000_000, 0);
+
+        // epoch 2
+        // shouldn't get any rewards for this epoch
+        let sui = redeem_fungible_stake(&mut staking_pool, fungible_stake_1, ctx(&mut scenario));
+        assert!(balance::value(&sui) == 1_000_000_000, 0);
+        sui::test_utils::destroy(sui);
+
+        assert!(staking_pool.pending_total_sui_withdraw == 1_000_000_000, 0);
+        assert!(staking_pool.pending_pool_token_withdraw == 1_000_000_000, 0);
+
+        assert!(distribute_rewards_and_advance_epoch(&mut staking_pool, &mut scenario, 1_000_000_000) == 3, 0);
+
+        assert!(staking_pool.sui_balance == 2_000_000_000, 0);
+        assert!(staking_pool.pool_token_balance == 1_000_000_000, 0);
+
+        // epoch 3
+        let sui = redeem_fungible_stake(&mut staking_pool, fungible_stake_2, ctx(&mut scenario));
+        std::debug::print(&balance::value(&sui));
+        assert!(balance::value(&sui) == 2_000_000_000, 0);
+        sui::test_utils::destroy(sui);
+        std::debug::print(&staking_pool);
+
+        sui::test_utils::destroy(staking_pool);
+        test_scenario::end(scenario);
+    }
+
+    #[test_only]
+    use sui::test_scenario::{Scenario};
+
+    #[test_only]
+    fun distribute_rewards_and_advance_epoch(
+        staking_pool: &mut StakingPool, 
+        scenario: &mut Scenario,
+        reward_amount: u64
+    ): u64 {
+        use sui::test_scenario::{Self, ctx};
+        use sui::tx_context::{epoch};
+        use sui::coin::{Self};
+
+        let rewards = coin::mint_for_testing<SUI>(reward_amount, ctx(scenario));
+        deposit_rewards(staking_pool, coin::into_balance(rewards));
+
+        process_pending_stakes_and_withdraws(staking_pool, ctx(scenario));
+        test_scenario::next_epoch(scenario, @0x0);
+
+        epoch(ctx(scenario))
     }
 }
